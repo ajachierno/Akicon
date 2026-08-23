@@ -156,6 +156,21 @@ browser, so you can pick tracks from the UI.
       custom_components.akicon: debug
   ```
 
-## License
+## Disclaimer
 
-MIT. See [LICENSE](LICENSE).
+Unofficial community integration, not affiliated with or endorsed by Akicon. Use at
+your own risk. Licensed under the MIT License — see [LICENSE](LICENSE).
+
+## Buy me a coffee
+
+Did you find this helpful? Consider supporting additional development:
+
+<a href="https://www.buymeacoffee.com/ajachiernoo" target="_blank">
+  <img src="https://raw.githubusercontent.com/ajachierno/Akicon/main/brand/bmc_button.png" alt="Buy me a coffee" height="50">
+</a>
+
+<br><br>
+
+<a href="https://www.buymeacoffee.com/ajachiernoo" target="_blank">
+  <img src="https://raw.githubusercontent.com/ajachierno/Akicon/main/brand/buymeacoffee_qr.png" alt="Buy me a coffee QR code" width="200">
+</a>
