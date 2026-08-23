@@ -51,11 +51,22 @@ class AkiconBridge:
         self._sock = f"/tmp/akicon-{safe}.sock"
         self._proc: asyncio.subprocess.Process | None = None
         self._lock = asyncio.Lock()
+        # Remembered so volume/mute set while idle apply when playback starts.
+        self._volume = 100
+        self._mute = False
 
     @property
     def mac(self) -> str:
         """Return the speaker's Bluetooth MAC."""
         return self._mac
+
+    def _mpv_running(self) -> bool:
+        """Return True if mpv is up and its IPC socket exists."""
+        return (
+            self._proc is not None
+            and self._proc.returncode is None
+            and os.path.exists(self._sock)
+        )
 
     # ---------------------------------------------------------------- Bluetooth
 
@@ -120,6 +131,8 @@ class AkiconBridge:
             "--really-quiet",
             "--vid=no",
             "--volume-max=100",
+            f"--volume={self._volume}",
+            f"--mute={'yes' if self._mute else 'no'}",
             f"--input-ipc-server={self._sock}",
         ]
         if self._audio_device:
@@ -198,36 +211,48 @@ class AkiconBridge:
         )
 
     async def async_pause(self) -> None:
-        """Pause playback."""
-        await self._rpc([["set_property", "pause", True]])
+        """Pause playback. No-op if nothing is running."""
+        if self._mpv_running():
+            await self._rpc([["set_property", "pause", True]])
 
     async def async_resume(self) -> None:
-        """Resume playback."""
-        await self._rpc([["set_property", "pause", False]])
+        """Resume playback. No-op if nothing is running."""
+        if self._mpv_running():
+            await self._rpc([["set_property", "pause", False]])
 
     async def async_stop(self) -> None:
-        """Stop playback and clear the playlist."""
-        await self._rpc([["stop"]])
+        """Stop playback and clear the playlist. No-op if nothing is running."""
+        if self._mpv_running():
+            await self._rpc([["stop"]])
 
     async def async_set_volume(self, level: float) -> None:
-        """Set volume from a 0.0-1.0 Home Assistant level."""
-        volume = max(0, min(100, round(level * 100)))
-        await self._rpc([["set_property", "volume", volume]])
+        """Set volume from a 0.0-1.0 Home Assistant level.
+
+        Remembered and applied at playback start when mpv is not running yet, so
+        moving the slider while idle never errors.
+        """
+        self._volume = max(0, min(100, round(level * 100)))
+        if self._mpv_running():
+            await self._rpc([["set_property", "volume", self._volume]])
 
     async def async_set_mute(self, mute: bool) -> None:
-        """Mute or unmute."""
-        await self._rpc([["set_property", "mute", mute]])
+        """Mute or unmute. Remembered until playback starts if idle."""
+        self._mute = bool(mute)
+        if self._mpv_running():
+            await self._rpc([["set_property", "mute", self._mute]])
 
     async def async_status(self) -> dict:
         """Return a snapshot of mpv's playback state.
 
-        Returns an empty dict if mpv is not running yet, so the entity can
-        report an idle/off state without raising.
+        When mpv is not running yet, report an idle state carrying the
+        remembered volume/mute so the UI slider still reflects them.
         """
-        if self._proc is None or self._proc.returncode is not None:
-            return {}
-        if not os.path.exists(self._sock):
-            return {}
+        if not self._mpv_running():
+            return {
+                "idle-active": True,
+                "volume": self._volume,
+                "mute": self._mute,
+            }
 
         props = [
             "idle-active",
