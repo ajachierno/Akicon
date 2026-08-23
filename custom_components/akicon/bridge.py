@@ -36,6 +36,9 @@ _CONNECT_TIMEOUT = 20
 _IPC_TIMEOUT = 3
 _MPV_START_TIMEOUT = 5
 _FF_START_GRACE = 0.4
+# Seconds of trailing silence appended under ffmpeg so the audio an A2DP speaker
+# drops from its buffer when playback ends is silence, not the real tail.
+_FF_TAIL_PAD = 4
 
 # Default PulseAudio socket on Home Assistant OS, used if the environment does
 # not already point at a server.
@@ -299,9 +302,13 @@ class AkiconBridge:
             url,
             "-vn",
         ]
+        filters = []
         gain = 0.0 if self._mute else self._volume / 100
         if abs(gain - 1.0) > 1e-3:
-            args += ["-af", f"volume={gain:.3f}"]
+            filters.append(f"volume={gain:.3f}")
+        # Trailing silence so an A2DP speaker clips silence, not the real tail.
+        filters.append(f"apad=pad_dur={_FF_TAIL_PAD}")
+        args += ["-af", ",".join(filters)]
         args += ["-f", "pulse", "-device", await self._resolve_sink(), "akicon"]
 
         env = dict(os.environ)
