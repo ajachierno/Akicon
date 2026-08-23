@@ -1,0 +1,42 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "Akicon Bath Fan Speaker",
+        "description": "Pair and trust the speaker with bluetoothctl on the Home Assistant host first, then enter its details here.",
+        "data": {
+          "name": "Name",
+          "mac": "Bluetooth MAC address",
+          "audio_device": "mpv audio device (optional)",
+          "mpv_path": "Path to mpv"
+        },
+        "data_description": {
+          "mac": "The speaker's Bluetooth address, e.g. AA:BB:CC:DD:EE:FF.",
+          "audio_device": "The mpv --audio-device string for the speaker's sink, e.g. pulse/bluez_output.AA_BB_CC_DD_EE_FF.1. Leave blank to use the host's default audio output. Run 'mpv --audio-device=help' to list devices.",
+          "mpv_path": "Leave as 'mpv' unless the binary lives somewhere unusual."
+        }
+      }
+    },
+    "error": {
+      "invalid_mac": "That does not look like a Bluetooth MAC address (expected AA:BB:CC:DD:EE:FF)."
+    },
+    "abort": {
+      "already_configured": "This speaker is already configured."
+    }
+  },
+  "options": {
+    "step": {
+      "init": {
+        "title": "Akicon audio settings",
+        "data": {
+          "audio_device": "mpv audio device",
+          "mpv_path": "Path to mpv"
+        },
+        "data_description": {
+          "audio_device": "The mpv --audio-device string for the speaker's sink. Leave blank for the host default.",
+          "mpv_path": "Path to the mpv executable."
+        }
+      }
+    }
+  }
+}
