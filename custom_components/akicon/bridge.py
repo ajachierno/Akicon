@@ -38,7 +38,7 @@ _MPV_START_TIMEOUT = 5
 _FF_START_GRACE = 0.4
 # Seconds of trailing silence appended under ffmpeg so the audio an A2DP speaker
 # drops from its buffer when playback ends is silence, not the real tail.
-_FF_TAIL_PAD = 7
+_FF_TAIL_PAD = 10
 
 # Default PulseAudio socket on Home Assistant OS, used if the environment does
 # not already point at a server.
