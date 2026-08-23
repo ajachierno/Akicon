@@ -15,27 +15,34 @@ Bluetooth and push a decoded audio stream.
 This integration does that on the Home Assistant host:
 
 1. It connects to the speaker over Bluetooth using `bluetoothctl` (BlueZ).
-2. It runs `mpv` as a long-lived background process and drives it over mpv's
-   JSON IPC socket. When you call `media_player.play_media`, it hands mpv the
-   URL; mpv decodes it and outputs the audio to the speaker's Bluetooth sink.
+2. It plays media through one of two engines, chosen automatically:
+   - **mpv** (preferred) runs as a long-lived background process driven over its
+     JSON IPC socket. Full transport control: play, pause, stop, volume, mute,
+     and title/position/duration readback.
+   - **ffmpeg** is the fallback for hosts where mpv cannot be installed — notably
+     Home Assistant OS, whose Core container ships ffmpeg but not mpv. It plays
+     the URL straight to the speaker's PulseAudio sink. Play, stop, and
+     pause/resume work; volume/mute changes apply to the next track, and
+     position/duration are not reported.
 
-Because TTS and Music Assistant both produce a URL, they work through the same
-path. The entity supports play, pause, stop, volume, mute, and reports
-title/position/duration while something is playing.
+Because TTS and Music Assistant both produce a URL, they work through either
+engine.
 
 ## Requirements
 
 This integration controls host-level Bluetooth audio, so it needs a Home
 Assistant install that can reach the host's Bluetooth and audio stack:
 
-- Home Assistant running on Linux (Core or Supervised) on hardware with a
-  working Bluetooth adapter — a Raspberry Pi or a mini PC is typical. It does
-  not work on Home Assistant OS in its default container setup, which does not
-  expose the host audio server to the core container.
-- `bluez` / `bluetoothctl` installed and the adapter powered on.
-- A working audio server (PipeWire or PulseAudio) that the Home Assistant
-  process can talk to.
-- `mpv` installed and on `PATH` (`sudo apt install mpv`).
+- Home Assistant on Linux with a working Bluetooth adapter — a Raspberry Pi or a
+  mini PC is typical. Home Assistant OS works too: its Core container ships
+  ffmpeg and the Supervisor provides a shared PulseAudio server, so the ffmpeg
+  engine plays to the speaker there without installing anything extra.
+- `bluez` / `bluetoothctl` and the adapter powered on.
+- A running audio server (PulseAudio or PipeWire) that exposes the speaker as a
+  sink. On Home Assistant OS this is already the case once the speaker is paired.
+- A playback engine: either `mpv` on `PATH` (`sudo apt install mpv`) for full
+  transport control, or `ffmpeg` (bundled with Home Assistant Core) for the
+  fallback path.
 
 ## Installation
 

@@ -75,8 +75,14 @@ class AkiconMediaPlayer(MediaPlayerEntity):
             model=MODEL,
         )
 
+    _STATE_MAP = {
+        "idle": MediaPlayerState.IDLE,
+        "playing": MediaPlayerState.PLAYING,
+        "paused": MediaPlayerState.PAUSED,
+    }
+
     async def async_update(self) -> None:
-        """Poll mpv for the current playback state."""
+        """Poll the bridge for the current playback state."""
         try:
             status = await self._bridge.async_status()
         except AkiconBridgeError:
@@ -85,36 +91,20 @@ class AkiconMediaPlayer(MediaPlayerEntity):
 
         self._attr_available = True
 
-        if not status:
-            self._attr_state = MediaPlayerState.IDLE
-            self._attr_media_title = None
-            self._attr_media_duration = None
-            self._attr_media_position = None
-            return
+        self._attr_state = self._STATE_MAP.get(
+            status.get("state", "idle"), MediaPlayerState.IDLE
+        )
 
         volume = status.get("volume")
         if volume is not None:
             self._attr_volume_level = max(0.0, min(1.0, volume / 100))
         self._attr_is_volume_muted = bool(status.get("mute"))
 
-        if status.get("idle-active") or status.get("eof-reached"):
-            self._attr_state = MediaPlayerState.IDLE
-            self._attr_media_title = None
-            self._attr_media_duration = None
-            self._attr_media_position = None
-            return
-
-        self._attr_state = (
-            MediaPlayerState.PAUSED
-            if status.get("pause")
-            else MediaPlayerState.PLAYING
-        )
-        self._attr_media_title = status.get("media-title")
-        duration = status.get("duration")
-        self._attr_media_duration = int(duration) if duration else None
-        position = status.get("time-pos")
+        self._attr_media_title = status.get("title")
+        self._attr_media_duration = status.get("duration")
+        position = status.get("position")
+        self._attr_media_position = position
         if position is not None:
-            self._attr_media_position = int(position)
             self._attr_media_position_updated_at = dt_util.utcnow()
 
     async def async_turn_on(self) -> None:

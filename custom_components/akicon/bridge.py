@@ -5,11 +5,18 @@ interface and no API. To use it like a Home Assistant media player we have to
 do two things on the host that runs Home Assistant:
 
 1. Hold a Bluetooth connection to the speaker (via ``bluetoothctl``).
-2. Decode media and push the audio to the speaker's audio sink (via ``mpv``).
+2. Decode media and push the audio to the speaker's audio sink.
 
-``mpv`` runs as a single long-lived, idle process and is driven over its JSON
-IPC socket, which gives us real transport control: load a URL, pause, resume,
-stop, set volume, and read back position/duration/title.
+Two playback engines are supported and auto-selected:
+
+* ``mpv`` (preferred) runs as a long-lived idle process driven over its JSON IPC
+  socket, giving real transport control: load a URL, pause, resume, stop, set
+  volume, and read back position/duration/title.
+* ``ffmpeg`` is the fallback for hosts where mpv cannot be installed (notably
+  Home Assistant OS, where the Core container ships ffmpeg but not mpv). It plays
+  a URL straight to the PulseAudio sink. Playback is per-track: play, stop, and
+  pause/resume (via process signals) work; live volume changes apply to the next
+  track, and position/duration are not reported.
 """
 
 from __future__ import annotations
@@ -20,6 +27,7 @@ import json
 import logging
 import os
 import shutil
+import signal
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -27,46 +35,66 @@ _LOGGER = logging.getLogger(__name__)
 _CONNECT_TIMEOUT = 20
 _IPC_TIMEOUT = 3
 _MPV_START_TIMEOUT = 5
+_FF_START_GRACE = 0.4
+
+# Default PulseAudio socket on Home Assistant OS, used if the environment does
+# not already point at a server.
+_HAOS_PULSE = "unix:/run/audio/pulse.sock"
 
 
 class AkiconBridgeError(Exception):
-    """Raised when the bridge cannot talk to mpv or the speaker."""
+    """Raised when the bridge cannot talk to the player or the speaker."""
 
 
 class AkiconBridge:
-    """Manage the Bluetooth connection and the mpv audio pipeline."""
+    """Manage the Bluetooth connection and the audio pipeline."""
 
     def __init__(
         self,
         mac: str,
         audio_device: str | None = None,
         mpv_path: str = "mpv",
+        ffmpeg_path: str = "ffmpeg",
     ) -> None:
         """Set up the bridge for one speaker."""
         self._mac = mac.upper()
         self._audio_device = audio_device or None
         self._mpv_path = mpv_path
-        # A per-speaker IPC socket, keyed by the sanitised MAC.
+        self._ffmpeg_path = ffmpeg_path
         safe = self._mac.replace(":", "")
         self._sock = f"/tmp/akicon-{safe}.sock"
+        self._engine: str | None = None
+        # mpv engine state
         self._proc: asyncio.subprocess.Process | None = None
-        self._lock = asyncio.Lock()
-        # Remembered so volume/mute set while idle apply when playback starts.
+        # ffmpeg engine state
+        self._ff_proc: asyncio.subprocess.Process | None = None
+        self._state = "idle"
+        # Shared, remembered so a change while idle applies at the next play.
         self._volume = 100
         self._mute = False
+        self._lock = asyncio.Lock()
 
     @property
     def mac(self) -> str:
         """Return the speaker's Bluetooth MAC."""
         return self._mac
 
-    def _mpv_running(self) -> bool:
-        """Return True if mpv is up and its IPC socket exists."""
-        return (
-            self._proc is not None
-            and self._proc.returncode is None
-            and os.path.exists(self._sock)
-        )
+    def _detect_engine(self) -> str:
+        """Pick and cache the playback engine: mpv if present, else ffmpeg."""
+        if self._engine:
+            return self._engine
+        if shutil.which(self._mpv_path):
+            self._engine = "mpv"
+        elif shutil.which(self._ffmpeg_path):
+            self._engine = "ffmpeg"
+        else:
+            raise AkiconBridgeError(
+                f"Neither mpv ('{self._mpv_path}') nor ffmpeg "
+                f"('{self._ffmpeg_path}') was found on the Home Assistant host. "
+                "Install mpv, or make ffmpeg available."
+            )
+        _LOGGER.debug("Akicon playback engine: %s", self._engine)
+        return self._engine
 
     # ---------------------------------------------------------------- Bluetooth
 
@@ -89,7 +117,6 @@ class AkiconBridge:
             "Connection successful" in combined or "already connected" in combined.lower()
         ):
             return
-        # bluetoothctl sometimes returns 0 without the success banner; verify.
         if await self.async_is_connected():
             return
         raise AkiconBridgeError(
@@ -101,25 +128,202 @@ class AkiconBridge:
         """Disconnect the speaker over Bluetooth."""
         await self._run("bluetoothctl", "disconnect", self._mac, timeout=_CONNECT_TIMEOUT)
 
-    # --------------------------------------------------------------------- mpv
-
     async def async_ensure_ready(self) -> None:
-        """Make sure the speaker is connected and mpv is running."""
+        """Make sure the speaker is connected and, for mpv, that it is running."""
         await self.async_connect()
-        await self._ensure_mpv()
+        if self._detect_engine() == "mpv":
+            await self._ensure_mpv()
+
+    # ----------------------------------------------------------- transport API
+
+    async def async_play_url(self, url: str) -> None:
+        """Load and play a URL, replacing anything currently playing."""
+        await self.async_connect()
+        if self._detect_engine() == "mpv":
+            await self._ensure_mpv()
+            await self._rpc(
+                [["loadfile", url, "replace"], ["set_property", "pause", False]]
+            )
+        else:
+            await self._ff_play(url)
+
+    async def async_pause(self) -> None:
+        """Pause playback. No-op if nothing is running."""
+        if self._engine == "ffmpeg":
+            if self._ff_running():
+                with contextlib.suppress(ProcessLookupError):
+                    self._ff_proc.send_signal(signal.SIGSTOP)
+                self._state = "paused"
+            return
+        if self._mpv_running():
+            await self._rpc([["set_property", "pause", True]])
+
+    async def async_resume(self) -> None:
+        """Resume playback. No-op if nothing is running."""
+        if self._engine == "ffmpeg":
+            if self._ff_running():
+                with contextlib.suppress(ProcessLookupError):
+                    self._ff_proc.send_signal(signal.SIGCONT)
+                self._state = "playing"
+            return
+        if self._mpv_running():
+            await self._rpc([["set_property", "pause", False]])
+
+    async def async_stop(self) -> None:
+        """Stop playback. No-op if nothing is running."""
+        if self._engine == "ffmpeg":
+            await self._ff_kill()
+            self._state = "idle"
+            return
+        if self._mpv_running():
+            await self._rpc([["stop"]])
+
+    async def async_set_volume(self, level: float) -> None:
+        """Set volume from a 0.0-1.0 level.
+
+        Applied live under mpv; under ffmpeg it takes effect on the next track.
+        """
+        self._volume = max(0, min(100, round(level * 100)))
+        if self._engine == "mpv" and self._mpv_running():
+            await self._rpc([["set_property", "volume", self._volume]])
+
+    async def async_set_mute(self, mute: bool) -> None:
+        """Mute or unmute (live under mpv, next-track under ffmpeg)."""
+        self._mute = bool(mute)
+        if self._engine == "mpv" and self._mpv_running():
+            await self._rpc([["set_property", "mute", self._mute]])
+
+    async def async_status(self) -> dict:
+        """Return a normalised playback snapshot.
+
+        Keys: state ('idle'|'playing'|'paused'), volume (0-100), mute (bool),
+        and title/duration/position (mpv only; None under ffmpeg).
+        """
+        if self._engine == "mpv":
+            return await self._mpv_status()
+        if self._engine == "ffmpeg":
+            return self._ffmpeg_status()
+        return self._idle_status()
+
+    async def async_shutdown(self) -> None:
+        """Stop playback and any long-lived process. Leaves Bluetooth alone."""
+        await self._ff_kill()
+        if self._proc is not None and self._proc.returncode is None:
+            with contextlib.suppress(Exception):
+                await self._rpc([["quit"]])
+            with contextlib.suppress(Exception):
+                await asyncio.wait_for(self._proc.wait(), timeout=3)
+            self._proc = None
+        with contextlib.suppress(FileNotFoundError):
+            os.unlink(self._sock)
+
+    # -------------------------------------------------------------- ffmpeg impl
+
+    def _ff_running(self) -> bool:
+        """Return True if the ffmpeg playback process is alive."""
+        return self._ff_proc is not None and self._ff_proc.returncode is None
+
+    def _pulse_device(self) -> str | None:
+        """The configured sink as ffmpeg wants it (no 'pulse/' prefix)."""
+        dev = self._audio_device
+        if not dev:
+            return None
+        if dev.startswith("pulse/"):
+            dev = dev[len("pulse/") :]
+        return dev
+
+    async def _ff_play(self, url: str) -> None:
+        """Play a URL to the PulseAudio sink via ffmpeg."""
+        await self._ff_kill()
+
+        args = [
+            self._ffmpeg_path,
+            "-nostdin",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-i",
+            url,
+            "-vn",
+        ]
+        gain = 0.0 if self._mute else self._volume / 100
+        if abs(gain - 1.0) > 1e-3:
+            args += ["-af", f"volume={gain:.3f}"]
+        args += ["-f", "pulse"]
+        device = self._pulse_device()
+        if device:
+            args += ["-device", device]
+        args += ["akicon"]
+
+        env = dict(os.environ)
+        env.setdefault("PULSE_SERVER", _HAOS_PULSE)
+
+        _LOGGER.debug("Starting ffmpeg: %s", " ".join(args))
+        try:
+            self._ff_proc = await asyncio.create_subprocess_exec(
+                *args,
+                stdin=asyncio.subprocess.DEVNULL,
+                stdout=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.PIPE,
+                env=env,
+            )
+        except FileNotFoundError as err:
+            raise AkiconBridgeError(
+                f"ffmpeg executable '{self._ffmpeg_path}' not found"
+            ) from err
+
+        self._state = "playing"
+
+        # Catch an immediate failure (e.g. ffmpeg built without the pulse muxer,
+        # or the audio server unreachable) and surface its message.
+        await asyncio.sleep(_FF_START_GRACE)
+        if self._ff_proc.returncode not in (None, 0):
+            err_out = b""
+            with contextlib.suppress(Exception):
+                err_out = await asyncio.wait_for(self._ff_proc.stderr.read(), timeout=1)
+            self._state = "idle"
+            raise AkiconBridgeError(
+                "ffmpeg could not play to PulseAudio: "
+                f"{err_out.decode(errors='replace').strip() or 'exited immediately'}"
+            )
+
+    async def _ff_kill(self) -> None:
+        """Terminate the ffmpeg process if running."""
+        if self._ff_proc is not None and self._ff_proc.returncode is None:
+            with contextlib.suppress(ProcessLookupError):
+                self._ff_proc.kill()
+            with contextlib.suppress(Exception):
+                await asyncio.wait_for(self._ff_proc.wait(), timeout=2)
+        self._ff_proc = None
+
+    def _ffmpeg_status(self) -> dict:
+        """Normalised status for the ffmpeg engine."""
+        if self._ff_proc is not None and self._ff_proc.returncode is not None:
+            self._state = "idle"
+        return {
+            "state": self._state,
+            "volume": self._volume,
+            "mute": self._mute,
+            "title": None,
+            "duration": None,
+            "position": None,
+        }
+
+    # ----------------------------------------------------------------- mpv impl
+
+    def _mpv_running(self) -> bool:
+        """Return True if mpv is up and its IPC socket exists."""
+        return (
+            self._proc is not None
+            and self._proc.returncode is None
+            and os.path.exists(self._sock)
+        )
 
     async def _ensure_mpv(self) -> None:
         """Start the idle mpv process if it is not already running."""
-        if self._proc is not None and self._proc.returncode is None:
+        if self._mpv_running():
             return
 
-        if shutil.which(self._mpv_path) is None:
-            raise AkiconBridgeError(
-                f"mpv executable '{self._mpv_path}' not found on the Home "
-                "Assistant host. Install mpv (e.g. 'apt install mpv')."
-            )
-
-        # A stale socket from a crashed process blocks a clean restart.
         with contextlib.suppress(FileNotFoundError):
             os.unlink(self._sock)
 
@@ -145,7 +349,6 @@ class AkiconBridge:
             stderr=asyncio.subprocess.DEVNULL,
         )
 
-        # Wait for the IPC socket to appear.
         for _ in range(_MPV_START_TIMEOUT * 10):
             if os.path.exists(self._sock):
                 return
@@ -177,11 +380,7 @@ class AkiconBridge:
 
     @staticmethod
     async def _read_reply(reader: asyncio.StreamReader, req_id: int):
-        """Read IPC lines until the reply matching req_id arrives.
-
-        mpv interleaves asynchronous ``event`` lines with command replies on the
-        same socket. Replies carry an ``error`` field and echo the request_id.
-        """
+        """Read IPC lines until the reply matching req_id arrives."""
         while True:
             try:
                 line = await asyncio.wait_for(reader.readline(), timeout=_IPC_TIMEOUT)
@@ -198,61 +397,10 @@ class AkiconBridge:
                     return msg.get("data")
                 return None
 
-    # ----------------------------------------------------------- transport API
-
-    async def async_play_url(self, url: str) -> None:
-        """Load and play a URL, replacing anything currently playing."""
-        await self.async_ensure_ready()
-        await self._rpc(
-            [
-                ["loadfile", url, "replace"],
-                ["set_property", "pause", False],
-            ]
-        )
-
-    async def async_pause(self) -> None:
-        """Pause playback. No-op if nothing is running."""
-        if self._mpv_running():
-            await self._rpc([["set_property", "pause", True]])
-
-    async def async_resume(self) -> None:
-        """Resume playback. No-op if nothing is running."""
-        if self._mpv_running():
-            await self._rpc([["set_property", "pause", False]])
-
-    async def async_stop(self) -> None:
-        """Stop playback and clear the playlist. No-op if nothing is running."""
-        if self._mpv_running():
-            await self._rpc([["stop"]])
-
-    async def async_set_volume(self, level: float) -> None:
-        """Set volume from a 0.0-1.0 Home Assistant level.
-
-        Remembered and applied at playback start when mpv is not running yet, so
-        moving the slider while idle never errors.
-        """
-        self._volume = max(0, min(100, round(level * 100)))
-        if self._mpv_running():
-            await self._rpc([["set_property", "volume", self._volume]])
-
-    async def async_set_mute(self, mute: bool) -> None:
-        """Mute or unmute. Remembered until playback starts if idle."""
-        self._mute = bool(mute)
-        if self._mpv_running():
-            await self._rpc([["set_property", "mute", self._mute]])
-
-    async def async_status(self) -> dict:
-        """Return a snapshot of mpv's playback state.
-
-        When mpv is not running yet, report an idle state carrying the
-        remembered volume/mute so the UI slider still reflects them.
-        """
+    async def _mpv_status(self) -> dict:
+        """Normalised status for the mpv engine."""
         if not self._mpv_running():
-            return {
-                "idle-active": True,
-                "volume": self._volume,
-                "mute": self._mute,
-            }
+            return self._idle_status()
 
         props = [
             "idle-active",
@@ -263,31 +411,47 @@ class AkiconBridge:
             "duration",
             "time-pos",
             "media-title",
-            "path",
         ]
         try:
             values = await self._rpc([["get_property", p] for p in props])
         except AkiconBridgeError:
-            return {}
-        return dict(zip(props, values))
+            return self._idle_status()
+        data = dict(zip(props, values))
 
-    async def async_shutdown(self) -> None:
-        """Quit mpv. Leaves the Bluetooth connection alone."""
-        if self._proc is not None and self._proc.returncode is None:
-            with contextlib.suppress(Exception):
-                await self._rpc([["quit"]])
-            with contextlib.suppress(Exception):
-                await asyncio.wait_for(self._proc.wait(), timeout=3)
-                self._proc = None
-        with contextlib.suppress(FileNotFoundError):
-            os.unlink(self._sock)
+        if data.get("idle-active") or data.get("eof-reached"):
+            state = "idle"
+        elif data.get("pause"):
+            state = "paused"
+        else:
+            state = "playing"
+
+        volume = data.get("volume")
+        duration = data.get("duration")
+        position = data.get("time-pos")
+        return {
+            "state": state,
+            "volume": int(volume) if volume is not None else self._volume,
+            "mute": bool(data.get("mute")),
+            "title": data.get("media-title") if state != "idle" else None,
+            "duration": int(duration) if duration else None,
+            "position": int(position) if position is not None else None,
+        }
+
+    def _idle_status(self) -> dict:
+        """A quiescent status carrying the remembered volume/mute."""
+        return {
+            "state": "idle",
+            "volume": self._volume,
+            "mute": self._mute,
+            "title": None,
+            "duration": None,
+            "position": None,
+        }
 
     # ----------------------------------------------------------------- helpers
 
     @staticmethod
-    async def _run(
-        *args: str, timeout: float = 5
-    ) -> tuple[int | None, str, str]:
+    async def _run(*args: str, timeout: float = 5) -> tuple[int | None, str, str]:
         """Run a host command, returning (returncode, stdout, stderr)."""
         try:
             proc = await asyncio.create_subprocess_exec(
