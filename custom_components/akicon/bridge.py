@@ -68,6 +68,7 @@ class AkiconBridge:
         self._proc: asyncio.subprocess.Process | None = None
         # ffmpeg engine state
         self._ff_proc: asyncio.subprocess.Process | None = None
+        self._ff_stderr_task: asyncio.Task | None = None
         self._state = "idle"
         # Shared, remembered so a change while idle applies at the next play.
         self._volume = 100
@@ -291,6 +292,7 @@ class AkiconBridge:
             self._ffmpeg_path,
             "-nostdin",
             "-hide_banner",
+            "-nostats",
             "-loglevel",
             "error",
             "-i",
@@ -334,14 +336,31 @@ class AkiconBridge:
                 f"{err_out.decode(errors='replace').strip() or 'exited immediately'}"
             )
 
+        # Keep draining stderr so a full pipe can never stall ffmpeg partway
+        # through a file (which would cut the audio off mid-playback).
+        self._ff_stderr_task = asyncio.create_task(self._ff_drain(self._ff_proc.stderr))
+
     async def _ff_kill(self) -> None:
         """Terminate the ffmpeg process if running."""
+        if self._ff_stderr_task is not None:
+            self._ff_stderr_task.cancel()
+            self._ff_stderr_task = None
         if self._ff_proc is not None and self._ff_proc.returncode is None:
             with contextlib.suppress(ProcessLookupError):
                 self._ff_proc.kill()
             with contextlib.suppress(Exception):
                 await asyncio.wait_for(self._ff_proc.wait(), timeout=2)
         self._ff_proc = None
+
+    @staticmethod
+    async def _ff_drain(stream: asyncio.StreamReader) -> None:
+        """Read ffmpeg stderr until EOF so its pipe can never fill and block."""
+        with contextlib.suppress(Exception):
+            while True:
+                line = await stream.readline()
+                if not line:
+                    break
+                _LOGGER.debug("ffmpeg: %s", line.decode(errors="replace").rstrip())
 
     def _ffmpeg_status(self) -> dict:
         """Normalised status for the ffmpeg engine."""
