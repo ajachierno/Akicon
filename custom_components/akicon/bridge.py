@@ -72,6 +72,7 @@ class AkiconBridge:
         # Shared, remembered so a change while idle applies at the next play.
         self._volume = 100
         self._mute = False
+        self._resolved_sink: str | None = None
         self._lock = asyncio.Lock()
 
     @property
@@ -106,27 +107,86 @@ class AkiconBridge:
         return "Connected: yes" in out
 
     async def async_connect(self) -> None:
-        """Connect to the speaker over Bluetooth, if not already connected."""
+        """Connect to the speaker, pairing it automatically if needed."""
         if await self.async_is_connected():
             return
+
+        await self._run("bluetoothctl", "power", "on")
+
+        # A plain connect works when the speaker is already paired and trusted.
         code, out, err = await self._run(
             "bluetoothctl", "connect", self._mac, timeout=_CONNECT_TIMEOUT
         )
-        combined = f"{out}\n{err}"
-        if code == 0 and (
-            "Connection successful" in combined or "already connected" in combined.lower()
-        ):
+        if self._connect_ok(code, out, err) or await self.async_is_connected():
             return
-        if await self.async_is_connected():
-            return
+
+        # Best-effort auto-pair when we have never bonded with it. This only
+        # succeeds if the speaker is discoverable (in pairing mode) and not held
+        # by another source such as a phone.
+        if not await self._is_paired():
+            _LOGGER.debug("Attempting to auto-pair %s", self._mac)
+            await self._run("bluetoothctl", "--timeout", "12", "scan", "on", timeout=16)
+            await self._run("bluetoothctl", "pair", self._mac, timeout=_CONNECT_TIMEOUT)
+            await self._run("bluetoothctl", "trust", self._mac)
+            code, out, err = await self._run(
+                "bluetoothctl", "connect", self._mac, timeout=_CONNECT_TIMEOUT
+            )
+            if self._connect_ok(code, out, err) or await self.async_is_connected():
+                return
+
         raise AkiconBridgeError(
-            f"Could not connect to {self._mac}. Pair and trust it once with "
-            f"bluetoothctl before using the integration. Output: {combined.strip()}"
+            f"Could not connect to {self._mac}. If it has never been paired, put "
+            "the speaker in pairing mode and disconnect it from any phone, then try "
+            "again; or pair it once by hand with bluetoothctl. Last output: "
+            f"{(out + err).strip()}"
         )
 
     async def async_disconnect(self) -> None:
         """Disconnect the speaker over Bluetooth."""
         await self._run("bluetoothctl", "disconnect", self._mac, timeout=_CONNECT_TIMEOUT)
+
+    async def _is_paired(self) -> bool:
+        """Return True if bluetoothctl reports the speaker as paired."""
+        code, out, _ = await self._run("bluetoothctl", "info", self._mac)
+        return code == 0 and "Paired: yes" in out
+
+    @staticmethod
+    def _connect_ok(code: int | None, out: str, err: str) -> bool:
+        """Return True if a bluetoothctl connect reported success."""
+        combined = f"{out}\n{err}".lower()
+        return code == 0 and (
+            "connection successful" in combined or "already connected" in combined
+        )
+
+    async def _resolve_sink(self) -> str:
+        """Return the PulseAudio sink name for the speaker (no 'pulse/' prefix).
+
+        Uses the configured value when given; otherwise finds the sink via
+        ``pactl`` when available, and finally derives the deterministic
+        PulseAudio bluez name from the MAC.
+        """
+        if self._audio_device:
+            dev = self._audio_device
+            return dev[len("pulse/") :] if dev.startswith("pulse/") else dev
+        if self._resolved_sink:
+            return self._resolved_sink
+
+        mac_us = self._mac.replace(":", "_")
+        try:
+            code, out, _ = await self._run("pactl", "list", "sinks", "short")
+        except AkiconBridgeError:
+            code, out = 1, ""
+        if code == 0:
+            for line in out.splitlines():
+                for field in line.split("\t"):
+                    if mac_us in field and "blue" in field.lower():
+                        self._resolved_sink = field.strip()
+                        _LOGGER.debug("Resolved sink via pactl: %s", self._resolved_sink)
+                        return self._resolved_sink
+
+        self._resolved_sink = f"bluez_sink.{mac_us}.a2dp_sink"
+        _LOGGER.debug("Derived sink from MAC: %s", self._resolved_sink)
+        return self._resolved_sink
 
     async def async_ensure_ready(self) -> None:
         """Make sure the speaker is connected and, for mpv, that it is running."""
@@ -223,15 +283,6 @@ class AkiconBridge:
         """Return True if the ffmpeg playback process is alive."""
         return self._ff_proc is not None and self._ff_proc.returncode is None
 
-    def _pulse_device(self) -> str | None:
-        """The configured sink as ffmpeg wants it (no 'pulse/' prefix)."""
-        dev = self._audio_device
-        if not dev:
-            return None
-        if dev.startswith("pulse/"):
-            dev = dev[len("pulse/") :]
-        return dev
-
     async def _ff_play(self, url: str) -> None:
         """Play a URL to the PulseAudio sink via ffmpeg."""
         await self._ff_kill()
@@ -249,11 +300,7 @@ class AkiconBridge:
         gain = 0.0 if self._mute else self._volume / 100
         if abs(gain - 1.0) > 1e-3:
             args += ["-af", f"volume={gain:.3f}"]
-        args += ["-f", "pulse"]
-        device = self._pulse_device()
-        if device:
-            args += ["-device", device]
-        args += ["akicon"]
+        args += ["-f", "pulse", "-device", await self._resolve_sink(), "akicon"]
 
         env = dict(os.environ)
         env.setdefault("PULSE_SERVER", _HAOS_PULSE)
@@ -337,10 +384,9 @@ class AkiconBridge:
             "--volume-max=100",
             f"--volume={self._volume}",
             f"--mute={'yes' if self._mute else 'no'}",
+            f"--audio-device=pulse/{await self._resolve_sink()}",
             f"--input-ipc-server={self._sock}",
         ]
-        if self._audio_device:
-            args.append(f"--audio-device={self._audio_device}")
 
         _LOGGER.debug("Starting mpv: %s", " ".join(args))
         self._proc = await asyncio.create_subprocess_exec(

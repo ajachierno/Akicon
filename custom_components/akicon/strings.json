@@ -3,17 +3,17 @@
     "step": {
       "user": {
         "title": "Akicon Bath Fan Speaker",
-        "description": "Pair and trust the speaker with bluetoothctl on the Home Assistant host first, then enter its details here.",
+        "description": "Enter the speaker's Bluetooth MAC address. The integration will try to pair and connect automatically; if that fails, pair it once with bluetoothctl on the Home Assistant host (see the docs).",
         "data": {
           "name": "Name",
           "mac": "Bluetooth MAC address",
-          "audio_device": "mpv audio device (optional)",
-          "mpv_path": "Path to mpv"
+          "audio_device": "Audio device (optional)",
+          "mpv_path": "Path to mpv (optional)"
         },
         "data_description": {
           "mac": "The speaker's Bluetooth address, e.g. AA:BB:CC:DD:EE:FF.",
-          "audio_device": "The mpv --audio-device string for the speaker's sink, e.g. pulse/bluez_output.AA_BB_CC_DD_EE_FF.1. Leave blank to use the host's default audio output. Run 'mpv --audio-device=help' to list devices.",
-          "mpv_path": "Leave as 'mpv' unless the binary lives somewhere unusual."
+          "audio_device": "Leave blank to auto-detect the speaker's PulseAudio sink from its MAC. Only set this for a non-standard sink or PipeWire, e.g. pulse/bluez_output.AA_BB_CC_DD_EE_FF.1.",
+          "mpv_path": "Leave as 'mpv'. Ignored when mpv is absent and the ffmpeg fallback is used."
         }
       }
     },
@@ -29,12 +29,12 @@
       "init": {
         "title": "Akicon audio settings",
         "data": {
-          "audio_device": "mpv audio device",
+          "audio_device": "Audio device",
           "mpv_path": "Path to mpv"
         },
         "data_description": {
-          "audio_device": "The mpv --audio-device string for the speaker's sink. Leave blank for the host default.",
-          "mpv_path": "Path to the mpv executable."
+          "audio_device": "Leave blank to auto-detect the speaker's PulseAudio sink from its MAC. Set only for a non-standard sink or PipeWire.",
+          "mpv_path": "Path to the mpv executable. Ignored when the ffmpeg fallback is used."
         }
       }
     }
