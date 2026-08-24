@@ -187,6 +187,10 @@ browser, so you can pick tracks from the UI.
 - Under the ffmpeg engine (Home Assistant OS), volume and mute apply to the next
   track rather than mid-playback, and position/duration aren't reported. The mpv
   engine has none of these limits.
+- A2DP speakers drop whatever is still buffered when playback ends, which would
+  clip the last few seconds of a file. Under ffmpeg the integration appends a
+  short trailing silence so nothing real is lost; the player therefore stays in
+  the `playing` state for a few extra seconds of silence after the audio ends.
 - The fan's own controls (the physical fan and light) are not part of this
   integration — it only handles the speaker.
 - Bluetooth range and interference apply as they would for any BT speaker.
