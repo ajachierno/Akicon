@@ -58,11 +58,10 @@ Assistant install that can reach the host's Bluetooth and audio stack:
 
 ## Installation
 
-### HACS (custom repository)
+### HACS
 
-1. In HACS, open the three-dot menu and choose **Custom repositories**.
-2. Add `https://github.com/ajachierno/Akicon` with category **Integration**.
-3. Install **Akicon Bath Fan Speaker** and restart Home Assistant.
+Search for **Akicon** in HACS, install **Akicon Bath Fan Speaker**, and
+restart Home Assistant.
 
 ### Manual
 
